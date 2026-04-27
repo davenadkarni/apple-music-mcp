@@ -348,30 +348,45 @@ def move_playlists_to_folder(folder_id: str, playlist_ids: list[str]) -> str:
 
                     // 2. Fetch all tracks in the playlist (library-song IDs)
                     step = 'get-tracks';
-                    let trackData = [];
+                    let libIds = [];
                     let offset = 0;
                     while (true) {{
                         const tRes = await mk.api.get('/v1/me/library/playlists/' + pid + '/tracks?limit=100&offset=' + offset);
                         const page = tRes.json && tRes.json.data || [];
-                        trackData = trackData.concat(page);
+                        libIds = libIds.concat(page.map(t => t.id));
                         if (!tRes.json || !tRes.json.next || page.length === 0) break;
                         offset += 100;
                     }}
 
-                    // 3. Create a new playlist in the folder with those tracks
+                    // 3. Look up catalog IDs from library IDs in batches of 25
+                    step = 'lookup-catalog-ids';
+                    let catalogIds = [];
+                    for (let i = 0; i < libIds.length; i += 25) {{
+                        const batch = libIds.slice(i, i + 25);
+                        const catRes = await mk.api.get(
+                            '/v1/me/library/songs?ids=' + batch.join(',') + '&include=catalog'
+                        );
+                        const songs = catRes.json && catRes.json.data || [];
+                        for (const song of songs) {{
+                            const catSongs = song.relationships && song.relationships.catalog && song.relationships.catalog.data || [];
+                            if (catSongs.length > 0) catalogIds.push(catSongs[0].id);
+                        }}
+                    }}
+
+                    // 4. Create a new playlist in the folder with catalog IDs
                     step = 'create-playlist';
                     const newPl = await mk.api.post('/v1/me/library/playlists', {{
                         body: JSON.stringify({{
                             attributes: {{ name: plName }},
                             relationships: {{
-                                tracks: {{ data: trackData.map(t => ({{ id: t.id, type: 'library-songs' }})) }},
+                                tracks: {{ data: catalogIds.map(id => ({{ id, type: 'songs' }})) }},
                                 parent: {{ data: [{{ id: folderId, type: 'library-playlist-folders' }}] }}
                             }}
                         }})
                     }});
                     const newId = newPl.json && newPl.json.data && newPl.json.data[0] && newPl.json.data[0].id;
 
-                    // 4. Delete the old playlist (returns 204/empty — ignore JSON parse errors)
+                    // 5. Delete the old playlist (returns 204/empty — ignore JSON parse errors)
                     step = 'delete-playlist';
                     try {{
                         await mk.api.delete('/v1/me/library/playlists/' + pid);
