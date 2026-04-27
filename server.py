@@ -333,29 +333,60 @@ def move_playlists_to_folder(folder_id: str, playlist_ids: list[str]) -> str:
         async () => {{
             const mk = MusicKit.getInstance();
             const ids = {json.dumps(playlist_ids)};
+            const folderId = {json.dumps(folder_id)};
             const moved = [];
             const failed = [];
+
             for (const pid of ids) {{
+                let step = 'init';
                 try {{
-                    await mk.api.patch('/v1/me/library/playlists/' + pid, {{
+                    // 1. Fetch the playlist metadata (name)
+                    step = 'get-playlist';
+                    const plRes = await mk.api.get('/v1/me/library/playlists/' + pid);
+                    const plData = plRes.json && plRes.json.data && plRes.json.data[0];
+                    const plName = plData && plData.attributes && plData.attributes.name || pid;
+
+                    // 2. Fetch all tracks in the playlist (library-song IDs)
+                    step = 'get-tracks';
+                    let trackData = [];
+                    let offset = 0;
+                    while (true) {{
+                        const tRes = await mk.api.get('/v1/me/library/playlists/' + pid + '/tracks?limit=100&offset=' + offset);
+                        const page = tRes.json && tRes.json.data || [];
+                        trackData = trackData.concat(page);
+                        if (!tRes.json || !tRes.json.next || page.length === 0) break;
+                        offset += 100;
+                    }}
+
+                    // 3. Create a new playlist in the folder with those tracks
+                    step = 'create-playlist';
+                    const newPl = await mk.api.post('/v1/me/library/playlists', {{
                         body: JSON.stringify({{
+                            attributes: {{ name: plName }},
                             relationships: {{
-                                parent: {{
-                                    data: [{{ id: '{folder_id}', type: 'library-playlist-folders' }}]
-                                }}
+                                tracks: {{ data: trackData.map(t => ({{ id: t.id, type: 'library-songs' }})) }},
+                                parent: {{ data: [{{ id: folderId, type: 'library-playlist-folders' }}] }}
                             }}
                         }})
                     }});
-                    moved.push(pid);
-                }} catch(e) {{
-                    if (e.message.includes('Unexpected end of JSON')) {{
-                        moved.push(pid);
-                    }} else {{
-                        failed.push(pid + ': ' + e.message);
+                    const newId = newPl.json && newPl.json.data && newPl.json.data[0] && newPl.json.data[0].id;
+
+                    // 4. Delete the old playlist (returns 204/empty — ignore JSON parse errors)
+                    step = 'delete-playlist';
+                    try {{
+                        await mk.api.delete('/v1/me/library/playlists/' + pid);
+                    }} catch(delErr) {{
+                        if (!delErr.message.includes('Unexpected end of JSON') && !delErr.message.includes('204')) {{
+                            throw delErr;
+                        }}
                     }}
+
+                    moved.push({{ old: pid, new: newId, name: plName }});
+                }} catch(e) {{
+                    failed.push(pid + ' [step=' + step + ']: ' + e.message);
                 }}
             }}
-            return {{ folder_id: '{folder_id}', moved, failed, message: 'Moved ' + moved.length + ' playlist(s) into folder.' }};
+            return {{ folder_id: folderId, moved, failed, message: 'Moved ' + moved.length + ' playlist(s) into folder.' }};
         }}
     """)
     return json.dumps(result, indent=2)
