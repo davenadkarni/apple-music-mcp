@@ -84,7 +84,7 @@ Then restart Claude Code.
 - **Rate limiting**: Apple Music search has a per-session rate limit. Large imports (500+ songs) may hit it; the server will report how many songs were successfully matched.
 - **Session expiry**: If tools stop working, re-run `auth.py` to refresh your browser session.
 - **Spotify matching**: Track matching uses fuzzy search — remaster/edition suffixes are stripped automatically. Expect ~90–95% match rates on typical playlists.
-- **`move_playlists_to_folder` — known UI refresh issue**: The tool works correctly, but the Apple Music web player may not visually update the sidebar until you interact with it. If playlists don't appear in the folder right away, drag any one playlist manually in the Music desktop app — this triggers a sync and all moved playlists will appear in the correct folder.
+- **`move_playlists_to_folder` — UI refresh**: The tool works correctly, but occasionally the Apple Music web player sidebar won't update immediately. If a playlist doesn't appear in the folder right away, try dragging any one playlist manually in the Music desktop app to trigger a sync.
 
 ## Security
 
