@@ -56,9 +56,10 @@ def search_songs(query: str, limit: int = 10) -> str:
         async () => {{
             const mk = MusicKit.getInstance();
             const sf = mk.storefrontId || 'us';
-            const term = encodeURIComponent({json.dumps(query)});
+            const term = (q => q.replace(/[^A-Za-z0-9 ]/g, c => encodeURIComponent(c)).replace(/ /g, '+'))({json.dumps(query)});
             const res = await mk.api.get('/v1/catalog/' + sf + '/search?term=' + term + '&types=songs&limit={limit}');
-            const songs = res.json && res.json.results && res.json.results.songs && res.json.results.songs.data || [];
+            const body = res.data || res.json || res;
+            const songs = body && body.results && body.results.songs && body.results.songs.data || [];
             return songs.map(s => ({{
                 id: s.id,
                 name: s.attributes.name,
@@ -87,11 +88,14 @@ def create_playlist(name: str, songs: list[str], description: str = "", folder_i
             const notFound = [];
             const trackIds = [];
 
+            // Serial search — MusicKit's mk.api.get does not handle parallel
+            // requests reliably (returns empty results under concurrency).
             for (const query of songQueries) {{
                 try {{
-                    const term = encodeURIComponent(query);
+                    const term = (q => q.replace(/[^A-Za-z0-9 ]/g, c => encodeURIComponent(c)).replace(/ /g, '+'))(query);
                     const res = await mk.api.get('/v1/catalog/' + sf + '/search?term=' + term + '&types=songs&limit=1');
-                    const matches = res.json && res.json.results && res.json.results.songs && res.json.results.songs.data || [];
+                    const body = res.data || res.json || res;
+                    const matches = body && body.results && body.results.songs && body.results.songs.data || [];
                     if (matches.length > 0) {{
                         trackIds.push(matches[0].id);
                         added.push(matches[0].attributes.name + ' — ' + matches[0].attributes.artistName);
@@ -142,15 +146,21 @@ def add_songs_to_playlist(playlist_id: str, songs: list[str]) -> str:
             const notFound = [];
             const trackIds = [];
 
+            // Serial search — mk.api.get does not handle parallel requests reliably
             for (const query of songQueries) {{
-                const term = encodeURIComponent(query);
-                const res = await mk.api.get('/v1/catalog/' + sf + '/search?term=' + term + '&types=songs&limit=1');
-                const matches = res.json && res.json.results && res.json.results.songs && res.json.results.songs.data || [];
-                if (matches.length > 0) {{
-                    trackIds.push(matches[0].id);
-                    added.push(matches[0].attributes.name + ' — ' + matches[0].attributes.artistName);
-                }} else {{
-                    notFound.push(query);
+                try {{
+                    const term = (q => q.replace(/[^A-Za-z0-9 ]/g, c => encodeURIComponent(c)).replace(/ /g, '+'))(query);
+                    const res = await mk.api.get('/v1/catalog/' + sf + '/search?term=' + term + '&types=songs&limit=1');
+                    const body = res.data || res.json || res;
+                    const matches = body && body.results && body.results.songs && body.results.songs.data || [];
+                    if (matches.length > 0) {{
+                        trackIds.push(matches[0].id);
+                        added.push(matches[0].attributes.name + ' — ' + matches[0].attributes.artistName);
+                    }} else {{
+                        notFound.push(query);
+                    }}
+                }} catch(e) {{
+                    notFound.push(query + ' (error: ' + e.message + ')');
                 }}
             }}
 
@@ -169,13 +179,85 @@ def add_songs_to_playlist(playlist_id: str, songs: list[str]) -> str:
 
 
 @mcp.tool()
+def reorder_playlist_tracks(playlist_id: str, ordered_track_ids: list[str]) -> str:
+    """
+    Reorder tracks in an Apple Music library playlist.
+
+    ordered_track_ids: library track IDs (the `id` field from get_playlist_tracks)
+                      listed in the desired final order. Must include every track
+                      currently in the playlist — any omitted track will be removed.
+
+    Works by deleting all current tracks then re-adding in the new order. There is
+    a brief moment when the playlist is empty; if you have it open on another
+    device it may flash empty before syncing the new order.
+    """
+    result = run_in_browser(f"""
+        async () => {{
+            const mk = MusicKit.getInstance();
+            const orderedIds = {json.dumps(ordered_track_ids)};
+
+            // Paginated fetch of current tracks
+            let currentTracks = [];
+            let offset = 0;
+            while (true) {{
+                const page = await mk.api.get('/v1/me/library/playlists/{playlist_id}/tracks?limit=100&offset=' + offset);
+                const pageTracks = (page.json && page.json.data) || [];
+                currentTracks = currentTracks.concat(pageTracks);
+                if (pageTracks.length < 100) break;
+                offset += 100;
+            }}
+
+            // Sanity: warn if requested order references unknown tracks
+            const currentIds = new Set(currentTracks.map(t => t.id));
+            const unknownIds = orderedIds.filter(id => !currentIds.has(id));
+
+            // Delete each current track
+            const deleted = [];
+            const deleteErrors = [];
+            for (const t of currentTracks) {{
+                try {{
+                    await mk.api.delete('/v1/me/library/playlists/{playlist_id}/tracks/' + t.id);
+                    deleted.push(t.id);
+                }} catch(e) {{
+                    if (e.message.includes('Unexpected end of JSON')) {{
+                        deleted.push(t.id);
+                    }} else {{
+                        deleteErrors.push(t.id + ': ' + e.message);
+                    }}
+                }}
+            }}
+
+            // Re-add in the new order (library-songs type preserves the same track refs)
+            try {{
+                await mk.api.post('/v1/me/library/playlists/{playlist_id}/tracks', {{
+                    body: JSON.stringify({{ data: orderedIds.map(id => ({{ id, type: 'library-songs' }})) }})
+                }});
+            }} catch(e) {{
+                if (!e.message.includes('Unexpected end of JSON')) throw e;
+            }}
+
+            return {{
+                playlist_id: '{playlist_id}',
+                previous_count: currentTracks.length,
+                deleted_count: deleted.length,
+                added_count: orderedIds.length,
+                unknown_ids: unknownIds,
+                delete_errors: deleteErrors,
+                message: 'Reordered playlist — ' + orderedIds.length + ' tracks in new order.'
+            }};
+        }}
+    """)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 def get_my_playlists() -> str:
     """List playlists in your Apple Music library."""
     result = run_in_browser("""
         async () => {
             const mk = MusicKit.getInstance();
             const res = await mk.api.get('/v1/me/library/playlists?limit=100');
-            const playlists = res.json && res.json.data || [];
+            const playlists = (res.data || res.json || res).data || [];
             return playlists.map(p => ({
                 id: p.id,
                 name: p.attributes.name,
@@ -192,7 +274,7 @@ def get_playlist_tracks(playlist_id: str) -> str:
         async () => {{
             const mk = MusicKit.getInstance();
             const res = await mk.api.get('/v1/me/library/playlists/{playlist_id}/tracks?limit=100');
-            const tracks = res.json && res.json.data || [];
+            const tracks = (res.data || res.json || res).data || [];
             return tracks.map((t, i) => ({{
                 index: i + 1,
                 id: t.id,
@@ -316,7 +398,7 @@ def get_folders() -> str:
         async () => {
             const mk = MusicKit.getInstance();
             const res = await mk.api.get('/v1/me/library/playlist-folders?limit=100');
-            const folders = res.json && res.json.data || [];
+            const folders = (res.data || res.json || res).data || [];
             return folders.map(f => ({
                 id: f.id,
                 name: f.attributes && f.attributes.name,
@@ -444,11 +526,56 @@ def _fetch_spotify_tracks(spotify_url: str):
 
     # Intercept Spotify's partner/catalog GraphQL API calls — full JSON with
     # track names AND artist names, bypassing any DOM rendering issues.
+    # Scroll the page to trigger pagination so we capture tracks beyond the
+    # initial viewport — Spotify lazy-loads as the user scrolls.
     result = run_in_browser(
         js="""
         async () => {
-            // Wait for the page to make its API calls
-            await new Promise(r => setTimeout(r, 5000));
+            // Initial wait for first batch of API calls
+            await new Promise(r => setTimeout(r, 2500));
+
+            // Find the playlist's scrollable container. Spotify wraps the
+            // main content in a scrollable viewport — without scrolling it,
+            // tracks past row ~25-50 never trigger pagination requests.
+            const findScroller = () => {
+                const selectors = [
+                    '[data-overlayscrollbars-viewport]',
+                    '.main-view-container__scroll-node',
+                    '.os-viewport',
+                    'main [data-testid="playlist-page"]',
+                    'main',
+                ];
+                for (const sel of selectors) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        if (el.scrollHeight > el.clientHeight + 100) return el;
+                    }
+                }
+                return document.scrollingElement || document.documentElement;
+            };
+
+            const scroller = findScroller();
+            const maxIterations = 30;
+
+            for (let i = 0; i < maxIterations; i++) {
+                const before = scroller.scrollTop;
+                scroller.scrollTop = Math.min(
+                    before + scroller.clientHeight,
+                    scroller.scrollHeight
+                );
+                // Wait for Spotify to fetch + render the next batch
+                await new Promise(r => setTimeout(r, 700));
+
+                const atBottom = scroller.scrollTop + scroller.clientHeight
+                                 >= scroller.scrollHeight - 50;
+
+                // Done as soon as we can't scroll AND we're at the bottom
+                if (scroller.scrollTop === before && atBottom) {
+                    // One final wait for any trailing API response
+                    await new Promise(r => setTimeout(r, 800));
+                    break;
+                }
+            }
+
             const title = document.title
                 .replace(/\\s*[|\\u2013-]\\s*Spotify\\s*$/i, '')
                 .replace(/\\s*on Spotify\\s*$/i, '')
@@ -568,6 +695,21 @@ def _fetch_spotify_tracks(spotify_url: str):
             )
 
     tracks = [_fix_encoding(t) for t in tracks]
+
+    # Dedup: Spotify's GraphQL can fire multiple queries that each return the
+    # first page of tracks, so the same track may appear in multiple captured
+    # responses. Preserve first-occurrence order. NOTE: this removes genuine
+    # back-to-back duplicates in the user's playlist too, but those are rare
+    # vs. the API-quirk dupes which are common.
+    seen = set()
+    deduped = []
+    for t in tracks:
+        key = t.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+    tracks = deduped
+
     return title, tracks
 
 
