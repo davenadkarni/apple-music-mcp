@@ -120,7 +120,8 @@ def create_playlist(name: str, songs: list[str], description: str = "", folder_i
                 body: JSON.stringify(body)
             }});
 
-            const pid = playlist.json && playlist.json.data && playlist.json.data[0] && playlist.json.data[0].id;
+            const plArr = Array.isArray(playlist.data) ? playlist.data : (((playlist.json || playlist).data) || []);
+            const pid = plArr[0] && plArr[0].id;
             return {{
                 playlist: {json.dumps(name)},
                 id: pid,
@@ -165,7 +166,7 @@ def add_songs_to_playlist(playlist_id: str, songs: list[str]) -> str:
             }}
 
             try {{
-                await mk.api.post('/v1/me/library/playlists/{playlist_id}/tracks', {{
+                await mk.api.post('/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/tracks', {{
                     body: JSON.stringify({{ data: trackIds.map(id => ({{ id, type: 'songs' }})) }})
                 }});
             }} catch(e) {{
@@ -200,11 +201,21 @@ def reorder_playlist_tracks(playlist_id: str, ordered_track_ids: list[str]) -> s
             let currentTracks = [];
             let offset = 0;
             while (true) {{
-                const page = await mk.api.get('/v1/me/library/playlists/{playlist_id}/tracks?limit=100&offset=' + offset);
-                const pageTracks = (page.json && page.json.data) || [];
+                const page = await mk.api.get('/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/tracks?limit=100&offset=' + offset);
+                const pageTracks = Array.isArray(page.data) ? page.data : (((page.json || page).data) || []);
                 currentTracks = currentTracks.concat(pageTracks);
                 if (pageTracks.length < 100) break;
                 offset += 100;
+            }}
+
+            // Safety: this tool deletes everything then re-adds. If we can't see
+            // the current tracks, deleting nothing + re-adding would duplicate
+            // every track — refuse instead.
+            if (currentTracks.length === 0) {{
+                return {{
+                    playlist_id: {json.dumps(playlist_id)},
+                    error: 'Could not read current playlist tracks (empty or unexpected API response). Aborting reorder to avoid duplicating tracks.'
+                }};
             }}
 
             // Sanity: warn if requested order references unknown tracks
@@ -216,7 +227,7 @@ def reorder_playlist_tracks(playlist_id: str, ordered_track_ids: list[str]) -> s
             const deleteErrors = [];
             for (const t of currentTracks) {{
                 try {{
-                    await mk.api.delete('/v1/me/library/playlists/{playlist_id}/tracks/' + t.id);
+                    await mk.api.delete('/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/tracks/' + t.id);
                     deleted.push(t.id);
                 }} catch(e) {{
                     if (e.message.includes('Unexpected end of JSON')) {{
@@ -229,7 +240,7 @@ def reorder_playlist_tracks(playlist_id: str, ordered_track_ids: list[str]) -> s
 
             // Re-add in the new order (library-songs type preserves the same track refs)
             try {{
-                await mk.api.post('/v1/me/library/playlists/{playlist_id}/tracks', {{
+                await mk.api.post('/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/tracks', {{
                     body: JSON.stringify({{ data: orderedIds.map(id => ({{ id, type: 'library-songs' }})) }})
                 }});
             }} catch(e) {{
@@ -237,7 +248,7 @@ def reorder_playlist_tracks(playlist_id: str, ordered_track_ids: list[str]) -> s
             }}
 
             return {{
-                playlist_id: '{playlist_id}',
+                playlist_id: {json.dumps(playlist_id)},
                 previous_count: currentTracks.length,
                 deleted_count: deleted.length,
                 added_count: orderedIds.length,
@@ -256,8 +267,15 @@ def get_my_playlists() -> str:
     result = run_in_browser("""
         async () => {
             const mk = MusicKit.getInstance();
-            const res = await mk.api.get('/v1/me/library/playlists?limit=100');
-            const playlists = (res.data || res.json || res).data || [];
+            let playlists = [];
+            let offset = 0;
+            while (true) {
+                const res = await mk.api.get('/v1/me/library/playlists?limit=100&offset=' + offset);
+                const page = Array.isArray(res.data) ? res.data : (((res.json || res).data) || []);
+                playlists = playlists.concat(page);
+                if (page.length < 100) break;
+                offset += 100;
+            }
             return playlists.map(p => ({
                 id: p.id,
                 name: p.attributes.name,
@@ -273,8 +291,15 @@ def get_playlist_tracks(playlist_id: str) -> str:
     result = run_in_browser(f"""
         async () => {{
             const mk = MusicKit.getInstance();
-            const res = await mk.api.get('/v1/me/library/playlists/{playlist_id}/tracks?limit=100');
-            const tracks = (res.data || res.json || res).data || [];
+            let tracks = [];
+            let offset = 0;
+            while (true) {{
+                const res = await mk.api.get('/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/tracks?limit=100&offset=' + offset);
+                const page = Array.isArray(res.data) ? res.data : (((res.json || res).data) || []);
+                tracks = tracks.concat(page);
+                if (page.length < 100) break;
+                offset += 100;
+            }}
             return tracks.map((t, i) => ({{
                 index: i + 1,
                 id: t.id,
@@ -297,13 +322,13 @@ def rename_playlist(playlist_id: str, name: str, description: str = "") -> str:
         async () => {{
             const mk = MusicKit.getInstance();
             try {{
-                await mk.api.patch('/v1/me/library/playlists/{playlist_id}', {{
+                await mk.api.patch('/v1/me/library/playlists/' + {json.dumps(playlist_id)}, {{
                     body: JSON.stringify({{ attributes: {json.dumps(attrs)} }})
                 }});
             }} catch(e) {{
                 if (!e.message.includes('Unexpected end of JSON')) throw e;
             }}
-            return {{ id: '{playlist_id}', name: {json.dumps(name)}, message: 'Playlist renamed successfully.' }};
+            return {{ id: {json.dumps(playlist_id)}, name: {json.dumps(name)}, message: 'Playlist renamed successfully.' }};
         }}
     """)
     return json.dumps(result, indent=2)
@@ -316,11 +341,11 @@ def delete_playlist(playlist_id: str) -> str:
         async () => {{
             const mk = MusicKit.getInstance();
             try {{
-                await mk.api.delete('/v1/me/library/playlists/{playlist_id}');
+                await mk.api.delete('/v1/me/library/playlists/' + {json.dumps(playlist_id)});
             }} catch(e) {{
                 if (!e.message.includes('Unexpected end of JSON')) throw e;
             }}
-            return {{ id: '{playlist_id}', message: 'Playlist deleted successfully.' }};
+            return {{ id: {json.dumps(playlist_id)}, message: 'Playlist deleted successfully.' }};
         }}
     """)
     return json.dumps(result, indent=2)
@@ -361,7 +386,7 @@ def set_playlist_artwork(playlist_id: str, image_url: str = "", image_path: str 
 
             try {{
                 const resp = await fetch(
-                    'https://api.music.apple.com/v1/me/library/playlists/{playlist_id}/artwork',
+                    'https://api.music.apple.com/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/artwork',
                     {{
                         method: 'PUT',
                         headers: {{
@@ -398,7 +423,7 @@ def get_folders() -> str:
         async () => {
             const mk = MusicKit.getInstance();
             const res = await mk.api.get('/v1/me/library/playlist-folders?limit=100');
-            const folders = (res.data || res.json || res).data || [];
+            const folders = Array.isArray(res.data) ? res.data : (((res.json || res).data) || []);
             return folders.map(f => ({
                 id: f.id,
                 name: f.attributes && f.attributes.name,
@@ -425,7 +450,8 @@ def move_playlists_to_folder(folder_id: str, playlist_ids: list[str]) -> str:
                     // 1. Fetch the playlist metadata (name)
                     step = 'get-playlist';
                     const plRes = await mk.api.get('/v1/me/library/playlists/' + pid);
-                    const plData = plRes.json && plRes.json.data && plRes.json.data[0];
+                    const plArr = Array.isArray(plRes.data) ? plRes.data : (((plRes.json || plRes).data) || []);
+                    const plData = plArr[0];
                     const plName = plData && plData.attributes && plData.attributes.name || pid;
 
                     // 2. Fetch all tracks in the playlist (library-song IDs)
@@ -434,9 +460,9 @@ def move_playlists_to_folder(folder_id: str, playlist_ids: list[str]) -> str:
                     let offset = 0;
                     while (true) {{
                         const tRes = await mk.api.get('/v1/me/library/playlists/' + pid + '/tracks?limit=100&offset=' + offset);
-                        const page = tRes.json && tRes.json.data || [];
+                        const page = Array.isArray(tRes.data) ? tRes.data : (((tRes.json || tRes).data) || []);
                         libIds = libIds.concat(page.map(t => t.id));
-                        if (!tRes.json || !tRes.json.next || page.length === 0) break;
+                        if (page.length < 100) break;
                         offset += 100;
                     }}
 
@@ -448,11 +474,18 @@ def move_playlists_to_folder(folder_id: str, playlist_ids: list[str]) -> str:
                         const catRes = await mk.api.get(
                             '/v1/me/library/songs?ids=' + batch.join(',') + '&include=catalog'
                         );
-                        const songs = catRes.json && catRes.json.data || [];
+                        const songs = Array.isArray(catRes.data) ? catRes.data : (((catRes.json || catRes).data) || []);
                         for (const song of songs) {{
                             const catSongs = song.relationships && song.relationships.catalog && song.relationships.catalog.data || [];
                             if (catSongs.length > 0) catalogIds.push(catSongs[0].id);
                         }}
+                    }}
+
+                    // Safety: if the playlist has tracks but we couldn't resolve any
+                    // catalog IDs, moving would create an empty copy and delete the
+                    // original — refuse instead.
+                    if (libIds.length > 0 && catalogIds.length === 0) {{
+                        throw new Error('Found ' + libIds.length + ' tracks but resolved 0 catalog IDs — aborting to avoid losing tracks.');
                     }}
 
                     // 4. Create a new playlist in the folder with catalog IDs
@@ -466,7 +499,8 @@ def move_playlists_to_folder(folder_id: str, playlist_ids: list[str]) -> str:
                             }}
                         }})
                     }});
-                    const newId = newPl.json && newPl.json.data && newPl.json.data[0] && newPl.json.data[0].id;
+                    const newArr = Array.isArray(newPl.data) ? newPl.data : (((newPl.json || newPl).data) || []);
+                    const newId = newArr[0] && newArr[0].id;
 
                     // 5. Delete the old playlist (returns 204/empty — ignore JSON parse errors)
                     step = 'delete-playlist';
