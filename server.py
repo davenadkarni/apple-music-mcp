@@ -222,20 +222,56 @@ def reorder_playlist_tracks(playlist_id: str, ordered_track_ids: list[str]) -> s
             const currentIds = new Set(currentTracks.map(t => t.id));
             const unknownIds = orderedIds.filter(id => !currentIds.has(id));
 
-            // Delete each current track
-            const deleted = [];
-            const deleteErrors = [];
-            for (const t of currentTracks) {{
-                try {{
-                    await mk.api.delete('/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/tracks/' + t.id);
-                    deleted.push(t.id);
-                }} catch(e) {{
-                    if (e.message.includes('Unexpected end of JSON')) {{
-                        deleted.push(t.id);
-                    }} else {{
-                        deleteErrors.push(t.id + ': ' + e.message);
-                    }}
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            const fetchCurrentIds = async () => {{
+                let tracks = [];
+                let off = 0;
+                while (true) {{
+                    const page = await mk.api.get('/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/tracks?limit=100&offset=' + off);
+                    const pageTracks = Array.isArray(page.data) ? page.data : (((page.json || page).data) || []);
+                    tracks = tracks.concat(pageTracks);
+                    if (pageTracks.length < 100) break;
+                    off += 100;
                 }}
+                return new Set(tracks.map(t => t.id));
+            }};
+
+            const deleteOne = async (id) => {{
+                try {{
+                    await mk.api.delete('/v1/me/library/playlists/' + {json.dumps(playlist_id)} + '/tracks/' + id);
+                    return null;
+                }} catch(e) {{
+                    if (e.message.includes('Unexpected end of JSON')) return null;
+                    return id + ': ' + e.message;
+                }}
+            }};
+
+            // Delete each current track, then verify with retries — Apple's API can
+            // report a delete as successful before it's actually committed server-side
+            // (observed lag of at least 1-2s). Re-adding on top of tracks that didn't
+            // actually get deleted yet silently duplicates the whole playlist, so we
+            // poll until the deletes are confirmed gone (or give up and abort).
+            let pending = currentTracks.map(t => t.id);
+            const deleteErrors = [];
+            const MAX_ATTEMPTS = 4;
+            for (let attempt = 0; attempt < MAX_ATTEMPTS && pending.length > 0; attempt++) {{
+                if (attempt > 0) await sleep(1500 * attempt);
+                for (const id of pending) {{
+                    const err = await deleteOne(id);
+                    if (err) deleteErrors.push(err);
+                }}
+                await sleep(1200);
+                const stillThere = await fetchCurrentIds();
+                pending = currentTracks.map(t => t.id).filter(id => stillThere.has(id));
+            }}
+
+            if (pending.length > 0) {{
+                return {{
+                    playlist_id: {json.dumps(playlist_id)},
+                    error: 'Could not confirm deletion of ' + pending.length + ' track(s) after ' + MAX_ATTEMPTS + ' attempts — aborting re-add to avoid duplicating tracks. The playlist was left with its original tracks (no changes made).',
+                    still_present: pending,
+                    delete_errors: deleteErrors
+                }};
             }}
 
             // Re-add in the new order (library-songs type preserves the same track refs)
@@ -250,7 +286,7 @@ def reorder_playlist_tracks(playlist_id: str, ordered_track_ids: list[str]) -> s
             return {{
                 playlist_id: {json.dumps(playlist_id)},
                 previous_count: currentTracks.length,
-                deleted_count: deleted.length,
+                deleted_count: currentTracks.length,
                 added_count: orderedIds.length,
                 unknown_ids: unknownIds,
                 delete_errors: deleteErrors,
